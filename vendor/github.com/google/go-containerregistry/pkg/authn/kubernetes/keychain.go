@@ -271,10 +271,12 @@ func urlsMatch(globURL *url.URL, targetURL *url.URL) (bool, error) {
 }
 
 func toAuthenticator(configs []authn.AuthConfig) (authn.Authenticator, error) {
-	cfg := configs[0]
+	cfg := configs
 
-	if cfg.Auth != "" {
-		cfg.Auth = ""
+	for i, _ := range cfg {
+		if cfg[i].Auth != "" {
+			cfg[i].Auth = ""
+		}
 	}
 
 	return authn.FromConfig(cfg), nil

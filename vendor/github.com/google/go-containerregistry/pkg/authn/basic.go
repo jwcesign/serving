@@ -21,9 +21,9 @@ type Basic struct {
 }
 
 // Authorization implements Authenticator.
-func (b *Basic) Authorization() (*AuthConfig, error) {
-	return &AuthConfig{
+func (b *Basic) Authorization() ([]AuthConfig, error) {
+	return []AuthConfig{{
 		Username: b.Username,
-		Password: b.Password,
+		Password: b.Password},
 	}, nil
 }

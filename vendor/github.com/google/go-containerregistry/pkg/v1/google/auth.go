@@ -113,15 +113,15 @@ type tokenSourceAuth struct {
 }
 
 // Authorization implements authn.Authenticator.
-func (tsa *tokenSourceAuth) Authorization() (*authn.AuthConfig, error) {
+func (tsa *tokenSourceAuth) Authorization() ([]authn.AuthConfig, error) {
 	token, err := tsa.Token()
 	if err != nil {
 		return nil, err
 	}
 
-	return &authn.AuthConfig{
+	return []authn.AuthConfig{{
 		Username: "_token",
-		Password: token.AccessToken,
+		Password: token.AccessToken},
 	}, nil
 }
 

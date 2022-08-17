@@ -135,12 +135,13 @@ func (dk *defaultKeychain) Resolve(target Resource) (Authenticator, error) {
 		return Anonymous, nil
 	}
 
-	return FromConfig(AuthConfig{
-		Username:      cfg.Username,
-		Password:      cfg.Password,
-		Auth:          cfg.Auth,
-		IdentityToken: cfg.IdentityToken,
-		RegistryToken: cfg.RegistryToken,
+	return FromConfig([]AuthConfig{
+		{
+			Username:      cfg.Username,
+			Password:      cfg.Password,
+			Auth:          cfg.Auth,
+			IdentityToken: cfg.IdentityToken,
+			RegistryToken: cfg.RegistryToken},
 	}), nil
 }
 
@@ -168,7 +169,7 @@ func (w wrapper) Resolve(r Resource) (Authenticator, error) {
 	// If the secret being stored is an identity token, the Username should be set to <token>
 	// ref: https://docs.docker.com/engine/reference/commandline/login/#credential-helper-protocol
 	if u == "<token>" {
-		return FromConfig(AuthConfig{Username: u, IdentityToken: p}), nil
+		return FromConfig([]AuthConfig{{Username: u, IdentityToken: p}}), nil
 	}
-	return FromConfig(AuthConfig{Username: u, Password: p}), nil
+	return FromConfig([]AuthConfig{{Username: u, Password: p}}), nil
 }

@@ -17,6 +17,8 @@ package transport
 import (
 	"encoding/base64"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"net/http"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -33,30 +35,48 @@ var _ http.RoundTripper = (*basicTransport)(nil)
 // RoundTrip implements http.RoundTripper
 func (bt *basicTransport) RoundTrip(in *http.Request) (*http.Response, error) {
 	if bt.auth != authn.Anonymous {
+		var err error
+		var res *http.Response
+
 		auth, err := bt.auth.Authorization()
 		if err != nil {
 			return nil, err
 		}
 
-		// http.Client handles redirects at a layer above the http.RoundTripper
-		// abstraction, so to avoid forwarding Authorization headers to places
-		// we are redirected, only set it when the authorization header matches
-		// the host with which we are interacting.
-		// In case of redirect http.Client can use an empty Host, check URL too.
-		if in.Host == bt.target || in.URL.Host == bt.target {
-			if bearer := auth.RegistryToken; bearer != "" {
-				hdr := fmt.Sprintf("Bearer %s", bearer)
-				in.Header.Set("Authorization", hdr)
-			} else if user, pass := auth.Username, auth.Password; user != "" && pass != "" {
-				delimited := fmt.Sprintf("%s:%s", user, pass)
-				encoded := base64.StdEncoding.EncodeToString([]byte(delimited))
-				hdr := fmt.Sprintf("Basic %s", encoded)
-				in.Header.Set("Authorization", hdr)
-			} else if token := auth.Auth; token != "" {
-				hdr := fmt.Sprintf("Basic %s", token)
-				in.Header.Set("Authorization", hdr)
+		log.Printf("jw:4:%v", auth)
+		for _, authConfig := range auth {
+			// http.Client handles redirects at a layer above the http.RoundTripper
+			// abstraction, so to avoid forwarding Authorization headers to places
+			// we are redirected, only set it when the authorization header matches
+			// the host with which we are interacting.
+			// In case of redirect http.Client can use an empty Host, check URL too.
+			if in.Host == bt.target || in.URL.Host == bt.target {
+				if bearer := authConfig.RegistryToken; bearer != "" {
+					hdr := fmt.Sprintf("Bearer %s", bearer)
+					in.Header.Set("Authorization", hdr)
+				} else if user, pass := authConfig.Username, authConfig.Password; user != "" && pass != "" {
+					delimited := fmt.Sprintf("%s:%s", user, pass)
+					encoded := base64.StdEncoding.EncodeToString([]byte(delimited))
+					hdr := fmt.Sprintf("Basic %s", encoded)
+					in.Header.Set("Authorization", hdr)
+				} else if token := authConfig.Auth; token != "" {
+					hdr := fmt.Sprintf("Basic %s", token)
+					in.Header.Set("Authorization", hdr)
+				}
+			}
+			res, err = bt.inner.RoundTrip(in)
+			if err != nil {
+				log.Printf("jw:5:%v", err)
+				continue
+			}
+			data, _ := ioutil.ReadAll(res.Body)
+			log.Printf("jw:6:%v----%v-----%v", string(data), res.Header, res.StatusCode)
+			if res.StatusCode == http.StatusOK {
+				return res, nil
 			}
 		}
+
+		return res, err
 	}
 	return bt.inner.RoundTrip(in)
 }

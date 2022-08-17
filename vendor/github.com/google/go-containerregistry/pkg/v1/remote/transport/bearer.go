@@ -38,7 +38,7 @@ type bearerTransport struct {
 	// Basic credentials that we exchange for bearer tokens.
 	basic authn.Authenticator
 	// Holds the bearer response from the token service.
-	bearer authn.AuthConfig
+	bearer []authn.AuthConfig
 	// Registry to which we send bearer tokens.
 	registry name.Registry
 	// See https://tools.ietf.org/html/rfc6750#section-3
@@ -67,51 +67,65 @@ func stringSet(ss []string) map[string]struct{} {
 
 // RoundTrip implements http.RoundTripper
 func (bt *bearerTransport) RoundTrip(in *http.Request) (*http.Response, error) {
-	sendRequest := func() (*http.Response, error) {
-		// http.Client handles redirects at a layer above the http.RoundTripper
-		// abstraction, so to avoid forwarding Authorization headers to places
-		// we are redirected, only set it when the authorization header matches
-		// the registry with which we are interacting.
-		// In case of redirect http.Client can use an empty Host, check URL too.
-		if matchesHost(bt.registry, in, bt.scheme) {
-			hdr := fmt.Sprintf("Bearer %s", bt.bearer.RegistryToken)
-			in.Header.Set("Authorization", hdr)
+	var res *http.Response
+	var err error
+	for _, authConfig := range bt.bearer {
+		sendRequest := func() (*http.Response, error) {
+			// http.Client handles redirects at a layer above the http.RoundTripper
+			// abstraction, so to avoid forwarding Authorization headers to places
+			// we are redirected, only set it when the authorization header matches
+			// the registry with which we are interacting.
+			// In case of redirect http.Client can use an empty Host, check URL too.
+			if matchesHost(bt.registry, in, bt.scheme) {
+				hdr := fmt.Sprintf("Bearer %s", authConfig.RegistryToken)
+				in.Header.Set("Authorization", hdr)
+			}
+			return bt.inner.RoundTrip(in)
 		}
-		return bt.inner.RoundTrip(in)
-	}
 
-	res, err := sendRequest()
-	if err != nil {
-		return nil, err
-	}
+		res, err = sendRequest()
+		if err != nil {
+			return nil, err
+		}
 
-	// If we hit a WWW-Authenticate challenge, it might be due to expired tokens or insufficient scope.
-	if challenges := authchallenge.ResponseChallenges(res); len(challenges) != 0 {
-		newScopes := []string{}
-		for _, wac := range challenges {
-			// TODO(jonjohnsonjr): Should we also update "realm" or "service"?
-			if want, ok := wac.Parameters["scope"]; ok {
-				// Add any scopes that we don't already request.
-				got := stringSet(bt.scopes)
-				if _, ok := got[want]; !ok {
-					newScopes = append(newScopes, want)
+		// If we hit a WWW-Authenticate challenge, it might be due to expired tokens or insufficient scope.
+		if challenges := authchallenge.ResponseChallenges(res); len(challenges) != 0 {
+			newScopes := []string{}
+			for _, wac := range challenges {
+				// TODO(jonjohnsonjr): Should we also update "realm" or "service"?
+				if want, ok := wac.Parameters["scope"]; ok {
+					// Add any scopes that we don't already request.
+					got := stringSet(bt.scopes)
+					if _, ok := got[want]; !ok {
+						newScopes = append(newScopes, want)
+					}
 				}
+			}
+
+			// Some registries seem to only look at the first scope parameter during a token exchange.
+			// If a request fails because it's missing a scope, we should put those at the beginning,
+			// otherwise the registry might just ignore it :/
+			newScopes = append(newScopes, bt.scopes...)
+			bt.scopes = newScopes
+
+			// TODO(jonjohnsonjr): Teach transport.Error about "error" and "error_description" from challenge.
+
+			// Retry the request to attempt to get a valid token.
+			if err = bt.refresh(in.Context()); err != nil {
+				return nil, err
+			}
+			res, err = sendRequest()
+			if err != nil {
+				return nil, err
+			}
+			if res.StatusCode == http.StatusOK {
+				return res, nil
 			}
 		}
 
-		// Some registries seem to only look at the first scope parameter during a token exchange.
-		// If a request fails because it's missing a scope, we should put those at the beginning,
-		// otherwise the registry might just ignore it :/
-		newScopes = append(newScopes, bt.scopes...)
-		bt.scopes = newScopes
-
-		// TODO(jonjohnsonjr): Teach transport.Error about "error" and "error_description" from challenge.
-
-		// Retry the request to attempt to get a valid token.
-		if err = bt.refresh(in.Context()); err != nil {
-			return nil, err
+		if res.StatusCode == http.StatusOK {
+			return res, nil
 		}
-		return sendRequest()
 	}
 
 	return res, err
@@ -122,67 +136,70 @@ func (bt *bearerTransport) RoundTrip(in *http.Request) (*http.Response, error) {
 // The basic token exchange is attempted first, falling back to the oauth flow.
 // If the IdentityToken is set, this indicates that we should start with the oauth flow.
 func (bt *bearerTransport) refresh(ctx context.Context) error {
-	auth, err := bt.basic.Authorization()
+	auths, err := bt.basic.Authorization()
 	if err != nil {
 		return err
 	}
 
-	if auth.RegistryToken != "" {
-		bt.bearer.RegistryToken = auth.RegistryToken
-		return nil
-	}
+	bt.bearer = make([]authn.AuthConfig, len(auths))
+	var authConfigs []authn.AuthConfig
+	for index, auth := range auths {
+		if auth.RegistryToken != "" {
+			bt.bearer[index].RegistryToken = auth.RegistryToken
+			return nil
+		}
 
-	var content []byte
-	if auth.IdentityToken != "" {
-		// If the secret being stored is an identity token,
-		// the Username should be set to <token>, which indicates
-		// we are using an oauth flow.
-		content, err = bt.refreshOauth(ctx)
-		var terr *Error
-		if errors.As(err, &terr) && terr.StatusCode == http.StatusNotFound {
-			// Note: Not all token servers implement oauth2.
-			// If the request to the endpoint returns 404 using the HTTP POST method,
-			// refer to Token Documentation for using the HTTP GET method supported by all token servers.
+		var content []byte
+		if auth.IdentityToken != "" {
+			// If the secret being stored is an identity token,
+			// the Username should be set to <token>, which indicates
+			// we are using an oauth flow.
+			content, err = bt.refreshOauth(ctx, auth)
+			var terr *Error
+			if errors.As(err, &terr) && terr.StatusCode == http.StatusNotFound {
+				// Note: Not all token servers implement oauth2.
+				// If the request to the endpoint returns 404 using the HTTP POST method,
+				// refer to Token Documentation for using the HTTP GET method supported by all token servers.
+				content, err = bt.refreshBasic(ctx)
+			}
+		} else {
 			content, err = bt.refreshBasic(ctx)
 		}
-	} else {
-		content, err = bt.refreshBasic(ctx)
-	}
-	if err != nil {
-		return err
-	}
+		if err != nil {
+			return err
+		}
 
-	// Some registries don't have "token" in the response. See #54.
-	type tokenResponse struct {
-		Token        string `json:"token"`
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		// TODO: handle expiry?
-	}
+		// Some registries don't have "token" in the response. See #54.
+		type tokenResponse struct {
+			Token        string `json:"token"`
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			// TODO: handle expiry?
+		}
 
-	var response tokenResponse
-	if err := json.Unmarshal(content, &response); err != nil {
-		return err
-	}
+		var response tokenResponse
+		if err := json.Unmarshal(content, &response); err != nil {
+			return err
+		}
 
-	// Some registries set access_token instead of token.
-	if response.AccessToken != "" {
-		response.Token = response.AccessToken
-	}
+		// Some registries set access_token instead of token.
+		if response.AccessToken != "" {
+			response.Token = response.AccessToken
+		}
 
-	// Find a token to turn into a Bearer authenticator
-	if response.Token != "" {
-		bt.bearer.RegistryToken = response.Token
-	} else {
-		return fmt.Errorf("no token in bearer response:\n%s", content)
-	}
+		// Find a token to turn into a Bearer authenticator
+		if response.Token != "" {
+			bt.bearer[index].RegistryToken = response.Token
+		} else {
+			return fmt.Errorf("no token in bearer response:\n%s", content)
+		}
 
-	// If we obtained a refresh token from the oauth flow, use that for refresh() now.
-	if response.RefreshToken != "" {
-		bt.basic = authn.FromConfig(authn.AuthConfig{
-			IdentityToken: response.RefreshToken,
-		})
+		// If we obtained a refresh token from the oauth flow, use that for refresh() now.
+		if response.RefreshToken != "" {
+			authConfigs = append(authConfigs, authn.AuthConfig{IdentityToken: response.RefreshToken})
+		}
 	}
+	bt.basic = authn.FromConfig(authConfigs)
 
 	return nil
 }
@@ -220,12 +237,7 @@ func canonicalAddress(host, scheme string) (address string) {
 }
 
 // https://docs.docker.com/registry/spec/auth/oauth/
-func (bt *bearerTransport) refreshOauth(ctx context.Context) ([]byte, error) {
-	auth, err := bt.basic.Authorization()
-	if err != nil {
-		return nil, err
-	}
-
+func (bt *bearerTransport) refreshOauth(ctx context.Context, auth authn.AuthConfig) ([]byte, error) {
 	u, err := url.Parse(bt.realm)
 	if err != nil {
 		return nil, err
