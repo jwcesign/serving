@@ -90,6 +90,7 @@ type config struct {
 	RevisionResponseStartTimeoutSeconds int    `split_words:"true"` // optional
 	RevisionIdleTimeoutSeconds          int    `split_words:"true"` // optional
 	ServingReadinessProbe               string `split_words:"true"` // optional
+	ServingStartupProbe                 string `split_words:"true"` // optional
 	EnableProfiling                     bool   `split_words:"true"` // optional
 	EnableHTTP2AutoDetection            bool   `split_words:"true"` // optional
 
@@ -234,8 +235,13 @@ func Main(opts ...Option) error {
 	// Do not set up probe if concurrency state endpoint is set, as
 	// paused containers don't play well with k8s readiness probes.
 	probe := func() bool { return true }
-	if env.ServingReadinessProbe != "" && env.ConcurrencyStateEndpoint == "" {
-		probe = buildProbe(logger, env.ServingReadinessProbe, env.EnableHTTP2AutoDetection).ProbeContainer
+	if env.ConcurrencyStateEndpoint == "" {
+		if env.ServingStartupProbe != "" {
+			probe = buildStartupProb(logger, env.ServingReadinessProbe, env.EnableHTTP2AutoDetection).ProbeContainer
+		}
+		if env.ServingReadinessProbe != "" {
+			probe = buildProbe(logger, env.ServingReadinessProbe, env.EnableHTTP2AutoDetection).ProbeContainer
+		}
 	}
 
 	var concurrencyendpoint *queue.ConcurrencyEndpoint
@@ -329,6 +335,17 @@ func exists(logger *zap.SugaredLogger, filename string) bool {
 }
 
 func buildProbe(logger *zap.SugaredLogger, encodedProbe string, autodetectHTTP2 bool) *readiness.Probe {
+	coreProbe, err := readiness.DecodeProbe(encodedProbe)
+	if err != nil {
+		logger.Fatalw("Queue container failed to parse readiness probe", zap.Error(err))
+	}
+	if autodetectHTTP2 {
+		return readiness.NewProbeWithHTTP2AutoDetection(coreProbe)
+	}
+	return readiness.NewProbe(coreProbe)
+}
+
+func buildStartupProb(logger *zap.SugaredLogger, encodedProbe string, autodetectHTTP2 bool) *readiness.Probe {
 	coreProbe, err := readiness.DecodeProbe(encodedProbe)
 	if err != nil {
 		logger.Fatalw("Queue container failed to parse readiness probe", zap.Error(err))
